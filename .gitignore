@@ -1,0 +1,9 @@
+build
+node_modules
+
+.env
+*.env
+*.js
+.openzeppelin
+package.json
+yarn.lock

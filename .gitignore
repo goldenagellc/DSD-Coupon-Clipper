@@ -7,3 +7,5 @@ node_modules
 .openzeppelin
 package.json
 yarn.lock
+
+.openzeppelin/.session

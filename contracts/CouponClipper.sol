@@ -21,7 +21,7 @@ interface ICHI {
     function freeFromUpTo(address _addr, uint _amount) external returns (uint);
 }
 
-// @notice Lets anybody trustlessly redeem coupons on anyone else's behalf for a fee (minimum fee is 2.0%).
+// @notice Lets anybody trustlessly redeem coupons on anyone else's behalf for a fee.
 //    Requires that the coupon holder has previously approved this contract via the DSDS `approveCoupons` function.
 // @dev Bots should scan for the `CouponApproval` event emitted by the DSDS `approveCoupons` function to find out which 
 //    users have approved this contract to redeem their coupons.
@@ -35,18 +35,17 @@ contract CouponClipper {
 
     // HOUSE_RATE_HALVING_AMNT -- Every time a bot brings in 100000DSD for the house, the house's
     // rate will be cut in half *for that bot and that bot alone*:
-    // * 1.00% for 0 -> 100000DSD
-    // * 0.50% for 100000DSD -> 200000DSD
-    // * 0.25% for 200000DSD -> 300000DSD
+    // * 50.0% of offer for 0 -> 100000DSD
+    // * 25.0% of offer 100000DSD -> 200000DSD
+    // * 12.5% of offer 200000DSD -> 300000DSD
     // ...
     uint constant private HOUSE_RATE_HALVING_AMNT = 100000e18;
-    uint constant private HOUSE_RATE = 100; // 1% -- initial fee taken by the house
-    uint constant private MIN_OFFER = 200; // 2% -- house fee, plus 1% to bot
+    uint constant private HOUSE_RATE = 5000; // 50% -- initial portion of the offer taken by house
     uint constant private MAX_OFFER = 5000; // 50% -- higher than this and DIP-2 penalty may eat into offer
     
     address public house = 0x871ee4648d0FBB08F39857F41da256659Eab6334; // collector of house take
 
-    // The basis points offered by coupon holders to have their coupons redeemed -- default is 200 bps (2%)
+    // The basis points offered by coupon holders to have their coupons redeemed -- default is 0 bps (0%)
     // E.g., offers[_user] = 500 indicates that _user will pay 500 basis points (5%) to the caller
     mapping(address => uint) private offers;
     // The coupon redemption loss (in basis points) deemed acceptable by coupon holder -- default is 0 bps (0%)
@@ -70,23 +69,18 @@ contract CouponClipper {
     }
 
     // @notice Gets the number of basis points the _user is offering the bots
-    // @dev The default value is 200 basis points (2.0%).
-    //   That is, `offers[_user] = 0` is interpretted as 2.0%.
-    //   This way users who are comfortable with the default 2.0% offer don't have to make any additional contract calls.
     // @param _user The account whose offer we're looking up.
     // @return The number of basis points the account is offering to have their coupons redeemed
     function getOffer(address _user) public view returns (uint) {
-        uint offer = offers[_user];
-        return offer < MIN_OFFER ? MIN_OFFER : offer;
+        return offers[_user];
     }
 
     // @notice Allows msg.sender to change the number of basis points they are offering.
-    // @dev _newOffer must be at least 200 (2%) and no more than 5000 (50%)
+    // @dev _newOffer must be no more than 5000 (50%)
     // @dev A user's offer cannot be *decreased* during the 15 minutes before the epoch advance (frontrun protection)
     // @param _offer The number of basis points msg.sender wants to offer to have their coupons redeemed.
     function setOffer(uint _newOffer) external {
         require(_newOffer <= MAX_OFFER, "Clipper: Offer above 50%");
-        require(_newOffer >= MIN_OFFER, "Clipper: Offer below 2%");
 
         if (_newOffer < offers[msg.sender]) {
             uint nextEpochStartTime = getEpochStartTime(DSDS.epoch() + 1);
@@ -127,27 +121,29 @@ contract CouponClipper {
     // @param _couponAmount The number of coupons to redeem (18 decimals)
     // @return the fee (in DSD) owned to the bot (msg.sender)
     function _redeem(address _user, uint _epoch, uint _couponAmount) internal returns (uint) {
+        // check that penalty isn't too high
+        uint penalty = DSDS.couponRedemptionPenalty(_epoch, _couponAmount);
+        if (penalty > _couponAmount.mul(getMaxPenalty(_user)).div(10_000)) return 0;
+
         // pull user's coupons into this contract (requires that the user has approved this contract)
         try DSDS.transferCoupons(_user, address(this), _epoch, _couponAmount) {
-            // check that penalty isn't too high
-            uint penalty = DSDS.couponRedemptionPenalty(_epoch, _couponAmount);
-            if (penalty > _couponAmount.mul(getMaxPenalty(_user)).div(10_000)) return 0;
-
             // redeem the coupons for DSD
             try DSDS.redeemCoupons(_epoch, _couponAmount) {
                 // compute fees
+                uint fee = _couponAmount.mul(getOffer(_user)).div(10_000);
+                // send the DSD to the user
+                DSD.transfer(_user, _couponAmount.sub(penalty).sub(fee)); // @audit-info : reverts on failure
+
                 // (x >> y) is equivalent to (x / 2**y) for positive integers
                 uint houseRate = HOUSE_RATE >> houseTakes[tx.origin].div(HOUSE_RATE_HALVING_AMNT);
-                uint houseFee = _couponAmount.mul(houseRate).div(10_000);
+                uint houseFee = fee.mul(houseRate).div(10_000);
                 houseTakes[tx.origin] = houseTakes[tx.origin].add(houseFee);
 
-                uint botRate = getOffer(_user).sub(houseRate);
-                uint botFee = _couponAmount.mul(botRate).div(10_000);
-                
-                // send the DSD to the user
-                DSD.transfer(_user, _couponAmount.sub(penalty).sub(houseFee).sub(botFee)); // @audit-info : reverts on failure
-                return botFee;
+                // return the bot fee
+                return fee.sub(houseFee);
             } catch {
+                // In this block the transfer succeeded but redemption failed, so we need to undo the transfer!!
+                DSDS.transferCoupons(address(this), _user, _epoch, _couponAmount);
                 return 0;
             }
         } catch {
